@@ -147,11 +147,17 @@ The client MUST:
 2. Build a native `SEND` satisfying the profile and verification rules below, sign its native block hash, and compute PoW.
 3. Encode `{ "block", "signature", "work" }` in `payload.transaction` using the defined decimal-string profile.
 
+When using the optional [payment-identifier](../../extensions/payment_identifier.md) extension, the client MUST reuse the
+original signed payment and identifier when retrying the same operation. A different identifier does not make a used
+payment reusable.
+
 ## Facilitator Verification Rules
 
 Facilitators MUST enforce these rules on `/verify` and independently before first submission during `/settle`. Failures
 return `isValid: false` with the listed `invalidReason` or `success: false` with the listed `errorReason`, without broadcast.
-Shared reasons follow the [v2 specification](../../x402-specification-v2.md). Pending retries follow Settlement below.
+Shared reasons follow the [v2 specification](../../x402-specification-v2.md). Pending settlement retries follow Settlement
+below. Optional confirmed recovery is checked after rules 1–10 and before the current-state and admission checks in
+rules 12–15; it does not admit a new payment or broadcast.
 
 1. **Protocol version.** Both `paymentPayload.x402Version` and the facilitator request's `x402Version` MUST be `2`.
    Failure: `invalid_x402_version`.
@@ -176,8 +182,12 @@ Shared reasons follow the [v2 specification](../../x402-specification-v2.md). Pe
    decoded from `address`. Failure: `invalid_exact_atto_signature`.
 10. **Proof-of-work.** Work MUST be valid for `previous` under the native network and block timestamp.
     Failure: `invalid_exact_atto_pow`.
-11. **Replay.** `/verify` MUST reject a canonical payment key known to be confirmed or previously claimed with
-    `duplicate_settlement`, without writing a reservation. `/settle` MUST apply the atomic duplicate check below.
+11. **Replay and recovery.** `/verify` MUST NOT reserve a canonical payment key or return `duplicate_settlement`.
+    A matching confirmed recovery MAY return `invalid_exact_atto_already_settled` as specified below. Other confirmed
+    replays fail the sender-frontier checks with `invalid_exact_atto_chain_state`. During `/verify`, a known claim whose
+    outcome remains unresolved MUST fail closed with `unexpected_verify_error` while the facilitator reconciles it; an
+    unresolved claim does not establish confirmation or invalid native account state. `/settle` MUST apply the atomic
+    duplicate check below.
 12. **Sender frontier.** From trusted canonical state, the sender MUST be opened, `height == current.height + 1`, and
     `previous == current.lastTransactionHash`; `block.version` MUST NOT be lower than the account's current version.
     Height arithmetic MUST NOT wrap.
@@ -196,6 +206,67 @@ settlement handling below.
 
 Atto exposes no simulation or dry-run endpoint; native validation and the account-state checks above provide preflight.
 
+### Optional confirmed recovery
+
+Facilitators MAY support recovery through the existing [payment-identifier](../../extensions/payment_identifier.md)
+extension. When offered, the first settlement claim MUST durably record the original identifier when present, or its
+absence otherwise, together with the payment/request binding in the original facilitator-caller scope. When an identifier
+is present, the resource server MUST bind it to its original application operation as described by the extension. An
+identifier supplied only on a later retry MUST NOT establish or replace the original binding. The canonical payment key
+remains `(network, nativeBlockHash)`, independently of the identifier.
+
+After rules 1–10 pass, `/verify` MAY return `isValid: false` with `invalid_exact_atto_already_settled` only when the exact
+`SEND` is canonically confirmed and the original identifier, caller scope, and payment/request binding match. The response
+MUST include the original hash and network in `extra.transaction` and `extra.network`. Missing original attribution,
+missing or changed identifiers, and binding conflicts MUST NOT authorize recovery; normal verification failures or the
+extension's conflict behavior apply. A confirmed replay that is not recoverable fails with `invalid_exact_atto_chain_state`.
+
+For the transaction fixture above:
+
+```json
+{
+  "isValid": false,
+  "invalidReason": "invalid_exact_atto_already_settled",
+  "payer": "atto://aab2cb576phbbpq5odorrz2lycmwpzgwgcn2kdk7dxoimzaskuy3rg4s6qz6c",
+  "extra": {
+    "transaction": "DEDCDD3B58E06441BD653FA01B917A943C05EAFAABF140B24BADB07B2BD2EEE0",
+    "network": "atto:local"
+  }
+}
+```
+
+This is evidence for recovery of the original operation, not a valid authorization for another resource execution or
+another settlement. A resource server opting into recovery MUST recognize this result before generic failed-verification
+handling, validate its original operation and authorization, and recover only that operation's retained result. A generic
+resource server MAY treat it as failed verification. A resource server tracking an unresolved original settlement MAY
+resume the existing `/settle` observation path without executing the operation again; `/verify` MUST NOT report that
+unresolved claim as already settled.
+
+### Error reasons
+
+The following table summarizes the numbered rules and settlement outcomes. Both endpoints enforce ordinary validation
+before a first submission; confirmed recovery and pending settlement retries follow their explicit paths above and below.
+
+| Reason | Meaning / endpoint |
+| --- | --- |
+| `invalid_x402_version` | Wrong protocol version; `/verify` or prebroadcast `/settle`. |
+| `invalid_scheme` | Scheme is not `exact`; both endpoints. |
+| `invalid_network` | Unsupported network or native network mismatch; both endpoints. |
+| `invalid_payment_requirements` | Malformed requirements or `accepted` mismatch; both endpoints. |
+| `invalid_payload` | Malformed transaction profile or native fields; both endpoints. |
+| `invalid_exact_atto_recipient_mismatch` | Receiver differs from `payTo`; both endpoints. |
+| `invalid_exact_atto_amount_mismatch` | Payment differs from the exact required amount; both endpoints. |
+| `invalid_exact_atto_signature` | Invalid native signature; both endpoints. |
+| `invalid_exact_atto_pow` | Invalid proof-of-work; both endpoints. |
+| `invalid_exact_atto_chain_state` | Invalid sender frontier, version, or balance conservation; both endpoints. |
+| `insufficient_funds` | Insufficient confirmed sender balance; both endpoints. |
+| `invalid_exact_atto_timestamp` | Invalid timestamp or expired first-broadcast deadline; both endpoints. |
+| `invalid_exact_atto_already_settled` | `/verify` only: confirmed original payment with matching recovery binding; not fresh authorization. |
+| `unexpected_verify_error` | `/verify`: trusted state is unavailable or a known claim remains unresolved pending reconciliation. |
+| `unexpected_settle_error` | `/settle`: trusted state is unavailable before any possible broadcast. |
+| `duplicate_settlement` | `/settle` only: competing or consumed claim; does not establish confirmation. |
+| `settlement_pending` | `/settle`: submitted transaction remains unresolved; nonterminal, with original hash and network. |
+
 ## Settlement
 
 The facilitator MUST submit the exact native `block`, `signature`, and `work` it verified, applying only the JSON
@@ -208,9 +279,38 @@ If submission occurred but confirmation cannot be established, the facilitator M
 response with the original hash and network. A retry observes that transaction before fresh sender-frontier or deadline
 checks, without creating another settlement claim or payment.
 
+### Settlement response examples
+
+Successful settlement of the transaction fixture above:
+
+```json
+{
+  "success": true,
+  "payer": "atto://aab2cb576phbbpq5odorrz2lycmwpzgwgcn2kdk7dxoimzaskuy3rg4s6qz6c",
+  "transaction": "DEDCDD3B58E06441BD653FA01B917A943C05EAFAABF140B24BADB07B2BD2EEE0",
+  "network": "atto:local"
+}
+```
+
+Submission occurred but confirmation cannot be established:
+
+```json
+{
+  "success": false,
+  "errorReason": "settlement_pending",
+  "payer": "atto://aab2cb576phbbpq5odorrz2lycmwpzgwgcn2kdk7dxoimzaskuy3rg4s6qz6c",
+  "transaction": "DEDCDD3B58E06441BD653FA01B917A943C05EAFAABF140B24BADB07B2BD2EEE0",
+  "network": "atto:local"
+}
+```
+
 ### Duplicate Settlement Mitigation (REQUIRED)
 
-Before submission, the facilitator MUST atomically claim the canonical payment key across every process serving `/settle`.
+Before first submission, the facilitator MUST durably and atomically claim the canonical payment key across every process
+serving `/settle`. The existence check and insertion MUST be one atomic operation with uniqueness on
+`(network, nativeBlockHash)`. When recovery is supported, the original identifier when present, or its absence otherwise,
+and the binding MUST be recorded in the same claim operation; changing the identifier MUST NOT create another claim for
+that payment.
 A competing claim MUST fail with the shared `duplicate_settlement` reason; this indicates a seen or consumed payment,
 not necessarily successful settlement. A completed payment MUST NOT yield another success; consumed keys MUST remain
 rejectable using retained settlement history or canonical ledger evidence.
@@ -223,10 +323,15 @@ deadline or confirmation timeout alone does not prove failure. Reconcile the ori
 Because the client chooses `block.timestamp` and native validation permits up to 60 seconds of future skew, the remaining
 x402 acceptance window at verification can be as long as `maxTimeoutSeconds + 60` seconds.
 
+The payment identifier is outside the native block signature and is not, by itself, proof of entitlement to recover an
+operation. Recovery depends on the original recorded binding and application authorization. Expiring an application result
+or recovery binding MUST NOT make a claimed or consumed payment reusable.
+
 ## References
 
 - [x402 v2 specification](../../x402-specification-v2.md)
 - [Generic exact scheme](./scheme_exact.md)
+- [Payment identifier extension](../../extensions/payment_identifier.md)
 - [HTTP transport v2](../../transports-v2/http.md)
 - [Atto integration documentation](https://atto.cash/docs/integration)
 - [Atto transaction format and offline signing](https://atto.cash/docs/integration/advanced/protocol-offline-signing-reference)
